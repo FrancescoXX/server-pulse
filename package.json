@@ -1,0 +1,10 @@
+{
+  "name": "server-pulse",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Paste a URL, get a web server health score",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

@@ -1,0 +1,15 @@
+zerops:
+  - setup: app
+    build:
+      base: nodejs@24
+      deployFiles: [.]
+    run:
+      base: nodejs@24
+      ports:
+        - port: 3000
+          httpSupport: true
+      healthCheck:
+        httpGet:
+          port: 3000
+          path: /status
+      start: node server.js
