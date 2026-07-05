@@ -170,7 +170,48 @@
   .check .hint { flex-basis: 100%; padding-left: 28px; font-size: 13px; color: var(--ink-3); margin-top: -4px; }
   .check-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; width: 100%; }
 
+  /* request phase breakdown */
+  .phasebar { display: flex; height: 12px; border-radius: 6px; overflow: hidden; margin: 4px 0 16px; }
+  .phasebar .seg { min-width: 3px; }
+  .phasebar .seg + .seg { margin-left: 2px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 20px; }
+  .legend .li { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ink-2); }
+  .legend .dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+  .legend b { color: var(--ink-1); font-weight: 500; font-variant-numeric: tabular-nums; }
+
+  /* TTFB stability columns */
+  .bench {
+    display: flex; align-items: flex-end; gap: 12px;
+    height: 120px; position: relative; margin-top: 10px;
+    border-bottom: 1px solid #2c2c2a; padding: 0 4px;
+  }
+  .bench .bcol { flex: 0 0 24px; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; }
+  .bench .bfill { background: #3987e5; border-radius: 4px 4px 0 0; transition: height .6s cubic-bezier(.2,.7,.3,1); }
+  .bench .median {
+    position: absolute; left: 0; right: 0; height: 0;
+    border-top: 1px solid #898781; pointer-events: none;
+  }
+  .bench .median span {
+    position: absolute; right: 0; bottom: 3px;
+    font-size: 11px; color: var(--ink-3); background: var(--surface); padding-left: 6px;
+  }
+  .bruns { display: flex; gap: 12px; padding: 6px 4px 0; }
+  .bruns span { flex: 0 0 24px; text-align: center; font-size: 11px; color: var(--ink-3); }
+
+  /* detected stack chips */
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 8px;
+    border: 1px solid var(--border); border-radius: 999px;
+    background: var(--surface-2); padding: 6px 13px; font-size: 13px;
+  }
+  .chip .cat-tag { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-3); }
+  .nodetect { font-size: 14px; color: var(--ink-2); }
+
   footer { margin-top: 56px; text-align: center; font-size: 13px; color: var(--ink-3); }
+  footer .credits { margin-top: 10px; color: var(--ink-2); }
+  footer a { color: var(--ink-1); text-decoration: none; border-bottom: 1px solid var(--ink-3); transition: border-color .15s; }
+  footer a:hover { border-color: var(--ink-1); }
 
   @keyframes spin { to { transform: rotate(360deg); } }
   .spinner {
@@ -229,10 +270,18 @@
     </div>
 
     <div class="tiles" id="tiles"></div>
+    <div id="extras"></div>
     <div id="cats"></div>
   </section>
 
-  <footer>Scores are heuristic — measured from this server's location in a single pass.</footer>
+  <footer>
+    <div>Scores are heuristic — measured from this server's location in a single pass.</div>
+    <div class="credits">
+      Done with <a href="https://zerops.io" target="_blank" rel="noopener">Zerops</a>
+      &nbsp;·&nbsp;
+      Made by <a href="https://francescociulla.com" target="_blank" rel="noopener">Francesco</a>
+    </div>
+  </footer>
 </div>
 
 <script>
@@ -292,6 +341,51 @@
     }
   });
 
+  // dark-mode categorical slots, fixed order per phase
+  const PHASE_COLORS = { dns: '#3987e5', tcp: '#199e70', tls: '#c98500', wait: '#9085e9', download: '#e66767' };
+  const CAT_NAMES = { framework: 'Framework', cms: 'CMS', language: 'Language', server: 'Server', cdn: 'CDN', platform: 'Platform' };
+
+  function renderExtras(d) {
+    let html = '';
+
+    if (d.phases && d.phases.length) {
+      const segs = d.phases.filter((p) => p.ms > 0);
+      html += '<div class="cat">' +
+        '<div class="cat-head"><h2>Request breakdown</h2><span class="pts">' + esc(d.timings.total) + ' ms total</span></div>' +
+        '<div class="phasebar">' + segs.map((p) =>
+          '<span class="seg" style="background:' + PHASE_COLORS[p.id] + ';flex-grow:' + p.ms + '" title="' + esc(p.label) + ': ' + p.ms + ' ms"></span>'
+        ).join('') + '</div>' +
+        '<div class="legend">' + d.phases.map((p) =>
+          '<span class="li"><span class="dot" style="background:' + PHASE_COLORS[p.id] + '"></span>' + esc(p.label) + ' <b>' + p.ms + ' ms</b></span>'
+        ).join('') + '</div></div>';
+    }
+
+    if (d.benchmark && d.benchmark.runs.length > 1) {
+      const b = d.benchmark;
+      const max = Math.max(...b.runs, 1);
+      html += '<div class="cat">' +
+        '<div class="cat-head"><h2>TTFB stability</h2><span class="pts">min ' + b.min + ' · median ' + b.median + ' · max ' + b.max + ' ms</span></div>' +
+        '<div class="bench">' +
+          '<div class="median" style="bottom:' + (b.median / max * 100) + '%"><span>median ' + b.median + ' ms</span></div>' +
+          b.runs.map((v, i) =>
+            '<div class="bcol" title="run ' + (i + 1) + ': ' + v + ' ms"><div class="bfill" style="height:' + Math.max(3, v / max * 100) + '%"></div></div>'
+          ).join('') +
+        '</div>' +
+        '<div class="bruns">' + b.runs.map((v, i) => '<span>' + (i + 1) + '</span>').join('') + '</div>' +
+        '</div>';
+    }
+
+    html += '<div class="cat"><div class="cat-head"><h2>Detected stack</h2></div>' +
+      (d.tech && d.tech.length
+        ? '<div class="chips">' + d.tech.map((x) =>
+            '<span class="chip"><span class="cat-tag">' + esc(CAT_NAMES[x.category] || x.category) + '</span>' + esc(x.name) + '</span>'
+          ).join('') + '</div>'
+        : '<div class="nodetect">Nothing recognizable from headers or markup — the server keeps its stack to itself.</div>') +
+      '</div>';
+
+    $('extras').innerHTML = html;
+  }
+
   function esc(s) {
     return String(s ?? '').replace(/[&<>"']/g, (c) =>
       ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
@@ -344,6 +438,8 @@
       '<div class="tile"><div class="label">' + esc(label) + '</div>' +
       '<div class="value">' + (v == null ? '–' : esc(v) + '<small>ms</small>') + '</div></div>'
     ).join('');
+
+    renderExtras(d);
 
     $('cats').innerHTML = d.categories.map((c) => {
       const pct = c.max ? (c.points / c.max) * 100 : 0;

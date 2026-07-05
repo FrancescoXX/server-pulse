@@ -7,11 +7,14 @@ const net = require('net');
 const dns = require('dns');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 
 const PORT = Number(process.env.PORT) || 3000;
 const REQUEST_TIMEOUT_MS = 12000;
 const MAX_REDIRECTS = 5;
 const MAX_BODY_BYTES = 1024 * 1024;
+const CAPTURE_BODY_BYTES = 256 * 1024;
+const BENCH_RUNS = 4; // extra TTFB samples on top of the main probe
 const USER_AGENT = 'ServerPulse/1.0 (url-health-check)';
 
 // ---------------------------------------------------------------------------
@@ -74,7 +77,7 @@ function assertPublicHost(urlObj) {
 // Probing
 // ---------------------------------------------------------------------------
 
-function fetchOnce(urlObj) {
+function fetchOnce(urlObj, opts = {}) {
   return new Promise((resolve, reject) => {
     const isHttps = urlObj.protocol === 'https:';
     const mod = isHttps ? https : http;
@@ -95,8 +98,15 @@ function fetchOnce(urlObj) {
     }, (res) => {
       t.firstByte = performance.now();
       let bodyBytes = 0;
+      const captured = [];
+      let capturedBytes = 0;
+      if (opts.abortBody) res.destroy();
       res.on('data', (chunk) => {
         bodyBytes += chunk.length;
+        if (opts.captureBody && capturedBytes < CAPTURE_BODY_BYTES) {
+          captured.push(chunk);
+          capturedBytes += chunk.length;
+        }
         if (bodyBytes > MAX_BODY_BYTES) res.destroy();
       });
       const finish = () => {
@@ -108,6 +118,7 @@ function fetchOnce(urlObj) {
           httpVersion: res.httpVersion,
           headers: res.headers,
           bodyBytes,
+          bodyBuffer: captured.length ? Buffer.concat(captured) : null,
           timings: t,
           tlsInfo: out.tls,
           remoteAddress: out.remoteAddress,
@@ -185,7 +196,7 @@ async function probe(inputUrl) {
 
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
     assertPublicHost(current);
-    hop = await fetchOnce(current);
+    hop = await fetchOnce(current, { captureBody: true });
     chain.push({ url: current.href, status: hop.statusCode });
     const loc = hop.headers.location;
     if ([301, 302, 303, 307, 308].includes(hop.statusCode) && loc) {
@@ -207,7 +218,128 @@ async function probe(inputUrl) {
     ? await alpnProbe(finalUrl.hostname, Number(finalUrl.port) || 443)
     : null;
 
-  return { requestedUrl: url.href, finalUrl: finalUrl.href, isHttps, chain, hop, alpn };
+  // TTFB stability: a few extra lightweight samples (headers only, body aborted)
+  const benchRuns = [Math.round(hop.timings.firstByte - hop.timings.start)];
+  for (let i = 0; i < BENCH_RUNS; i++) {
+    try {
+      const r = await fetchOnce(finalUrl, { abortBody: true });
+      benchRuns.push(Math.round(r.timings.firstByte - r.timings.start));
+    } catch {
+      break; // partial data is still a benchmark
+    }
+  }
+
+  return { requestedUrl: url.href, finalUrl: finalUrl.href, isHttps, chain, hop, alpn, benchRuns };
+}
+
+// ---------------------------------------------------------------------------
+// Tech detection
+// ---------------------------------------------------------------------------
+
+function decodeBody(buf, encoding) {
+  if (!buf) return '';
+  const enc = String(encoding || '').toLowerCase();
+  const lax = { finishFlush: zlib.constants.Z_SYNC_FLUSH }; // tolerate truncated capture
+  try {
+    if (enc.includes('br')) {
+      return zlib.brotliDecompressSync(buf, {
+        finishFlush: zlib.constants.BROTLI_OPERATION_FLUSH,
+      }).toString('utf8');
+    }
+    if (enc.includes('gzip')) return zlib.gunzipSync(buf, lax).toString('utf8');
+    if (enc.includes('deflate')) return zlib.inflateSync(buf, lax).toString('utf8');
+    if (enc.includes('zstd') && zlib.zstdDecompressSync) {
+      return zlib.zstdDecompressSync(buf).toString('utf8');
+    }
+    return buf.toString('utf8');
+  } catch {
+    return '';
+  }
+}
+
+// Signature list: [category, name, test(headers, lowercased-body, cookieNames)]
+const TECH_SIGNATURES = [
+  // frameworks / meta-frameworks
+  ['framework', 'Next.js', (h, b) => b.includes('__next_data__') || b.includes('/_next/') || /next\.js/i.test(h['x-powered-by'] || '')],
+  ['framework', 'Nuxt', (h, b) => b.includes('__nuxt') || b.includes('/_nuxt/')],
+  ['framework', 'SvelteKit', (h, b) => b.includes('data-sveltekit')],
+  ['framework', 'Remix', (h, b) => b.includes('__remixcontext')],
+  ['framework', 'Gatsby', (h, b) => b.includes('___gatsby')],
+  ['framework', 'Astro', (h, b) => b.includes('astro-island') || b.includes('<astro-')],
+  ['framework', 'Angular', (h, b) => b.includes('ng-version=')],
+  ['framework', 'React', (h, b) => b.includes('data-reactroot') || b.includes('react-dom')],
+  ['framework', 'Vue', (h, b) => b.includes('data-v-app') || b.includes('__vue')],
+  ['framework', 'Laravel', (h, b, c) => c.includes('laravel_session') || b.includes('livewire')],
+  ['framework', 'Django', (h, b, c) => b.includes('csrfmiddlewaretoken') || c.includes('csrftoken')],
+  ['framework', 'Ruby on Rails', (h, b, c) => b.includes('rails-ujs') || b.includes('data-turbo-track') || c.some((n) => n.endsWith('_session') && n !== 'laravel_session')],
+  ['framework', 'Express', (h, b, c) => (h['x-powered-by'] || '').toLowerCase() === 'express' || c.includes('connect.sid')],
+  ['framework', 'ASP.NET', (h, b, c) => /asp\.net/i.test(h['x-powered-by'] || '') || c.includes('asp.net_sessionid')],
+  ['framework', 'Phoenix', (h) => /cowboy/i.test(h.server || '')],
+  // CMS / site builders
+  ['cms', 'WordPress', (h, b) => b.includes('wp-content') || b.includes('wp-includes') || /wordpress/i.test(h['x-generator'] || '')],
+  ['cms', 'Drupal', (h, b) => !!h['x-drupal-cache'] || /drupal/i.test(h['x-generator'] || '') || b.includes('drupal-settings-json')],
+  ['cms', 'Ghost', (h, b) => /ghost/i.test(bodyGenerator(b))],
+  ['cms', 'Shopify', (h, b) => b.includes('cdn.shopify.com') || !!h['x-shopify-stage'] || !!h['x-shopid']],
+  ['cms', 'Wix', (h) => !!h['x-wix-request-id']],
+  ['cms', 'Squarespace', (h) => /squarespace/i.test(h.server || '')],
+  ['cms', 'Hugo', (h, b) => /hugo/i.test(bodyGenerator(b))],
+  ['cms', 'Jekyll', (h, b) => /jekyll/i.test(bodyGenerator(b))],
+  ['cms', 'Docusaurus', (h, b) => b.includes('docusaurus')],
+  // languages / runtimes
+  ['language', 'PHP', (h, b, c) => /php/i.test(h['x-powered-by'] || '') || c.includes('phpsessid')],
+  ['language', 'Java', (h, b, c) => c.includes('jsessionid') || /servlet|tomcat|jetty/i.test(h['x-powered-by'] || h.server || '')],
+  ['language', 'Python', (h) => /gunicorn|uvicorn|werkzeug/i.test(h.server || '')],
+  // web servers
+  ['server', 'nginx', (h) => /nginx|openresty/i.test(h.server || '')],
+  ['server', 'Apache', (h) => /apache/i.test(h.server || '')],
+  ['server', 'Caddy', (h) => /caddy/i.test(h.server || '')],
+  ['server', 'LiteSpeed', (h) => /litespeed/i.test(h.server || '')],
+  ['server', 'IIS', (h) => /microsoft-iis/i.test(h.server || '')],
+  // CDN / edge / platform
+  ['cdn', 'Cloudflare', (h) => !!h['cf-ray'] || /cloudflare/i.test(h.server || '')],
+  ['cdn', 'Fastly', (h) => /fastly/i.test(h['x-served-by'] || '') || /fastly/i.test(h.via || '')],
+  ['cdn', 'CloudFront', (h) => !!h['x-amz-cf-id'] || /cloudfront/i.test(h.via || '')],
+  ['cdn', 'Akamai', (h) => !!h['x-akamai-transformed'] || /akamai/i.test(h.server || '')],
+  ['cdn', 'Varnish', (h) => /varnish/i.test(h.via || '') || !!h['x-varnish']],
+  ['platform', 'Vercel', (h) => !!h['x-vercel-id'] || /vercel/i.test(h.server || '')],
+  ['platform', 'Netlify', (h) => !!h['x-nf-request-id'] || /netlify/i.test(h.server || '')],
+  ['platform', 'GitHub Pages', (h) => /github\.com/i.test(h.server || '')],
+];
+
+// language implied by a detected framework — only added when nothing detected it directly
+const FRAMEWORK_LANGUAGE = {
+  'Next.js': 'JavaScript / Node.js', Nuxt: 'JavaScript / Node.js', SvelteKit: 'JavaScript / Node.js',
+  Remix: 'JavaScript / Node.js', Gatsby: 'JavaScript / Node.js', Express: 'JavaScript / Node.js',
+  Laravel: 'PHP', WordPress: 'PHP', Drupal: 'PHP',
+  Django: 'Python', 'Ruby on Rails': 'Ruby', 'ASP.NET': 'C# / .NET', Phoenix: 'Elixir',
+};
+
+function bodyGenerator(body) {
+  const m = body.match(/<meta[^>]+name=["']generator["'][^>]+content=["']([^"']+)/i);
+  return m ? m[1] : '';
+}
+
+function detectTech(headers, bodyBuffer, contentEncoding) {
+  const body = decodeBody(bodyBuffer, contentEncoding).slice(0, CAPTURE_BODY_BYTES).toLowerCase();
+  const cookies = (headers['set-cookie'] || []).map((c) => c.split('=')[0].trim().toLowerCase());
+  const found = [];
+  for (const [category, name, test] of TECH_SIGNATURES) {
+    try {
+      if (test(headers, body, cookies)) found.push({ category, name });
+    } catch { /* one bad signature must not kill detection */ }
+  }
+  // generator meta tag as a generic fallback
+  const gen = bodyGenerator(body);
+  if (gen && !found.some((f) => gen.toLowerCase().includes(f.name.toLowerCase()))) {
+    found.push({ category: 'cms', name: gen.replace(/\b\d[\d.]*\b/g, '').trim() || gen });
+  }
+  if (!found.some((f) => f.category === 'language')) {
+    const fw = found.find((f) => FRAMEWORK_LANGUAGE[f.name]);
+    if (fw) found.push({ category: 'language', name: FRAMEWORK_LANGUAGE[fw.name] });
+  }
+  // dedupe by name, keep first occurrence (signature order = specificity)
+  const seen = new Set();
+  return found.filter((f) => !seen.has(f.name) && seen.add(f.name)).slice(0, 10);
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +369,26 @@ function buildReport(p) {
     ttfb: ms(t.start, t.firstByte),
     total: ms(t.start, t.end),
   };
+
+  // phase breakdown — contiguous segments of the final request
+  const phases = [
+    { id: 'dns', label: 'DNS', ms: timings.dns ?? 0 },
+    { id: 'tcp', label: 'TCP connect', ms: timings.tcp ?? 0 },
+    { id: 'tls', label: 'TLS handshake', ms: timings.tls ?? 0 },
+    { id: 'wait', label: 'Server wait', ms: ms(t.secure ?? t.connect ?? t.start, t.firstByte) ?? 0 },
+    { id: 'download', label: 'Download', ms: ms(t.firstByte, t.end) ?? 0 },
+  ];
+
+  const runs = (p.benchRuns || []).filter((n) => Number.isFinite(n));
+  const sorted = [...runs].sort((a, b) => a - b);
+  const benchmark = runs.length ? {
+    runs,
+    min: sorted[0],
+    median: sorted[Math.floor(sorted.length / 2)],
+    max: sorted[sorted.length - 1],
+  } : null;
+
+  const tech = detectTech(h, hop.bodyBuffer, h['content-encoding']);
 
   const checks = [];
   const add = (category, id, label, status, value, points, max, hint) => {
@@ -380,6 +532,10 @@ function buildReport(p) {
     score,
     grade,
     timings,
+    phases,
+    benchmark,
+    tech,
+    pageBytes: hop.bodyBytes,
     categories,
     checks,
     fetchedAt: new Date().toISOString(),

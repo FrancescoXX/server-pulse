@@ -14,8 +14,19 @@ and grades what it finds across three categories:
 | **Security** | 35 | HTTPS, TLS version, certificate validity, HSTS, CSP, `X-Content-Type-Options`, clickjacking protection, `Referrer-Policy` |
 | **Best practices** | 25 | Compression (brotli/gzip), HTTP/2 support (ALPN probe), caching headers, redirect-chain length, `Server` header version disclosure |
 
+Beyond the score, each analysis includes:
+
+- **Request breakdown** — a phase chart of the final request: DNS → TCP →
+  TLS → server wait → download.
+- **TTFB stability** — 5 timed runs charted with min / median / max, so a
+  lucky first hit doesn't hide jitter.
+- **Detected stack** — framework, language, CMS, web server, CDN, and
+  platform recognized from response headers, cookies, and page markup
+  (Next.js, Nuxt, SvelteKit, WordPress, Laravel, Django, Rails, Cloudflare,
+  Vercel, and ~30 more signatures).
+
 The UI is a single dark, minimal page: an animated score ring, timing stat
-tiles, and per-check pass/warn/fail rows with hints on what to fix.
+tiles, two charts, and per-check pass/warn/fail rows with hints on what to fix.
 
 ## Run it
 
